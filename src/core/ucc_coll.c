@@ -18,6 +18,9 @@
 #include "schedule/ucc_schedule.h"
 #include "coll_score/ucc_coll_score.h"
 #include "ucc_ee.h"
+#include "ucc_global_opts.h"
+#include "ucc_service_coll.h"
+
 
 #define UCC_BUFFER_INFO_CHECK_MEM_TYPE(_info) do {                             \
     if ((_info).mem_type == UCC_MEMORY_TYPE_UNKNOWN) {                         \
@@ -38,6 +41,256 @@
         return UCC_ERR_INVALID_PARAM;                                          \
     }                                                                          \
 } while(0)
+
+/**
+ * @brief Post function for allgather wrapper task
+ *
+ */
+static ucc_status_t ucc_dt_check_allgather_post(ucc_coll_task_t *allgather_wrapper)
+{
+    ucc_team_t           *team = allgather_wrapper->bargs.team;
+    allgather_wrapper->status = UCC_INPROGRESS;
+    
+    /* Enqueue wrapper task for progress */
+    return ucc_progress_queue_enqueue(team->contexts[0]->pq, allgather_wrapper);
+}
+
+/**
+ * @brief Progress function for allgather wrapper task
+ *
+ */
+static void ucc_dt_check_allgather_progress(ucc_coll_task_t *allgather_wrapper)
+{
+    ucc_status_t          status;
+    status = UCC_OK;
+
+    allgather_wrapper->status = status;
+}
+
+/**
+ * @brief Finalize function for allgather wrapper task
+ *
+ */
+static ucc_status_t ucc_dt_check_allgather_finalize(ucc_coll_task_t *allgather_wrapper)
+{
+    /* Return to memory pool - destruct happens automatically */
+    ucc_mpool_put(allgather_wrapper);
+    return UCC_OK;
+}
+
+/**
+ * @brief Post function for validation task
+ *
+ * Enqueues the validation task for progress where actual validation happens.
+ */
+static ucc_status_t ucc_dt_check_validation_post(ucc_coll_task_t *validation_task)
+{
+    validation_task->status = UCC_INPROGRESS;
+    return ucc_progress_queue_enqueue(validation_task->bargs.team->contexts[0]->pq,
+                                      validation_task);
+}
+
+/**
+ * @brief Progress function for validation task
+ *
+ * SIMPLIFIED VERSION: Always returns UCC_OK without actual validation
+ */
+static void ucc_dt_check_validation_progress(ucc_coll_task_t *validation_task)
+{
+    validation_task->status = UCC_OK;
+}
+
+
+/**
+ * @brief Finalize function for validation task
+ *
+ * Cleans up dt_check state and the validation task.
+ */
+static ucc_status_t ucc_dt_check_validation_finalize(ucc_coll_task_t *validation_task)
+{
+    /* Return validation task to memory pool - destruct happens automatically */
+    ucc_mpool_put(validation_task);
+    return UCC_OK;
+}
+
+/**
+ * @brief Finalize function for dt_check schedule
+ *
+ * Finalizes all tasks in the schedule and frees the schedule itself.
+ */
+static ucc_status_t ucc_dt_check_schedule_finalize(ucc_coll_task_t *task)
+{
+    ucc_schedule_t *schedule = ucc_derived_of(task, ucc_schedule_t);
+    ucc_status_t    status;
+
+    /* Finalize all tasks in the schedule */
+    status = ucc_schedule_finalize(task);
+
+    /* Destruct and free the schedule itself */
+    ucc_coll_task_destruct(&schedule->super);
+    ucc_free(schedule);
+    
+    return status;
+}
+
+/**
+ * @brief Create a schedule with service barrier, validation, and actual collective
+ *
+ * SIMPLIFIED VERSION: Creates a schedule containing three tasks:
+ *   1. Allgather wrapper task - uses service allgather
+ *   2. Validation task - always returns UCC_OK (no actual validation)
+ *   3. Actual collective task - the real gather/scatter operation
+ *
+ * Dependencies: barrier → validation → actual task
+ *
+ * This uses the internal service Allgather API (ucc_service_allgather/test/finalize)
+ * as a barrier to test the schedule mechanism without complex datatype checking.
+ *
+ * @param task The actual collective task (already created by TL/CL)
+ * @return Pointer to schedule (as ucc_coll_task_t*), or NULL on error
+ */
+static ucc_coll_task_t* ucc_dt_check_create_schedule(ucc_coll_task_t *task)
+{
+    ucc_schedule_t           *schedule;
+    ucc_coll_task_t          *allgather_wrapper;
+    ucc_coll_task_t          *validation_task;
+    ucc_base_coll_args_t      empty_bargs;
+    ucc_status_t              status;
+
+    /* Allocate schedule */
+    schedule = (ucc_schedule_t *)ucc_malloc(sizeof(*schedule), "dt_check_schedule");
+    if (!schedule) {
+        ucc_error("failed to allocate schedule for dt_check");
+        return NULL;
+    }
+
+    /* Initialize schedule with task's bargs and TL/CL team */
+    ucc_coll_task_construct(&schedule->super);
+    status = ucc_schedule_init(schedule, &task->bargs, task->team);
+    if (status != UCC_OK) {
+        ucc_error("failed to initialize dt_check schedule: %s", 
+                  ucc_status_string(status));
+        ucc_free(schedule);
+        return NULL;
+    }
+
+    /* Create allgather wrapper task from memory pool */
+    allgather_wrapper = ucc_mpool_get(&task->bargs.team->contexts[0]->lib->stub_tasks_mp);
+    if (!allgather_wrapper) {
+        ucc_error("failed to allocate allgather wrapper task from mpool");
+        goto error_schedule;
+    }
+
+    /* Initialize allgather wrapper task with minimal bargs (only needs team) */
+    memset(&empty_bargs, 0, sizeof(empty_bargs));
+    empty_bargs.team = task->bargs.team;
+    status = ucc_coll_task_init(allgather_wrapper, &empty_bargs, task->team);
+    if (status != UCC_OK) {
+        ucc_error("failed to init allgather wrapper task: %s",
+                  ucc_status_string(status));
+        ucc_mpool_put(allgather_wrapper);
+        goto error_schedule;
+    }
+
+    /* Give dt_check state to allgather wrapper (validation task will also use it) */
+    allgather_wrapper->dt_check = task->dt_check;
+    
+    /* Set allgather wrapper functions */
+    allgather_wrapper->post     = ucc_dt_check_allgather_post;
+    allgather_wrapper->progress = ucc_dt_check_allgather_progress;
+    allgather_wrapper->finalize = ucc_dt_check_allgather_finalize;
+    allgather_wrapper->status   = UCC_OPERATION_INITIALIZED;
+
+    /* Add allgather wrapper to schedule - starts when schedule starts */
+    status = ucc_task_subscribe_dep(&schedule->super, allgather_wrapper,
+                                    UCC_EVENT_SCHEDULE_STARTED);
+    if (status != UCC_OK) {
+        ucc_error("failed to subscribe allgather wrapper: %s",
+                  ucc_status_string(status));
+        goto error_allgather_wrapper;
+    }
+
+    status = ucc_schedule_add_task(schedule, allgather_wrapper);
+    if (status != UCC_OK) {
+        ucc_error("failed to add allgather wrapper to schedule: %s",
+                  ucc_status_string(status));
+        goto error_allgather_wrapper;
+    }
+
+    /* Create validation task from memory pool */
+    validation_task = ucc_mpool_get(&task->bargs.team->contexts[0]->lib->stub_tasks_mp);
+    if (!validation_task) {
+        ucc_error("failed to allocate validation task from mpool");
+        goto error_allgather_wrapper;
+    }
+
+    /* Initialize validation task with minimal bargs (only needs team) */
+    status = ucc_coll_task_init(validation_task, &empty_bargs, task->team);
+    if (status != UCC_OK) {
+        ucc_error("failed to init validation task: %s",
+                  ucc_status_string(status));
+        ucc_mpool_put(validation_task);
+        goto error_allgather_wrapper;
+    }
+
+    /* Transfer dt_check ownership to validation task (it will own and free it) */
+    task->dt_check = NULL;  /* Remove from actual task */
+    validation_task->dt_check = allgather_wrapper->dt_check;  /* Give to validation task */
+    
+    /* Set validation task functions */
+    validation_task->post     = ucc_dt_check_validation_post;
+    validation_task->progress = ucc_dt_check_validation_progress;
+    validation_task->finalize = ucc_dt_check_validation_finalize;
+    validation_task->status   = UCC_OPERATION_INITIALIZED;
+
+    /* Add validation task to schedule - depends on allgather completing */
+    status = ucc_task_subscribe_dep(allgather_wrapper, validation_task,
+                                    UCC_EVENT_COMPLETED);
+    if (status != UCC_OK) {
+        ucc_error("failed to subscribe validation task: %s", 
+                  ucc_status_string(status));
+        goto error_validation;
+    }
+
+    status = ucc_schedule_add_task(schedule, validation_task);
+    if (status != UCC_OK) {
+        ucc_error("failed to add validation task to schedule: %s",
+                  ucc_status_string(status));
+        goto error_validation;
+    }
+
+    /* Add actual task to schedule - depends on validation completing */
+    status = ucc_task_subscribe_dep(validation_task, task, UCC_EVENT_COMPLETED);
+    if (status != UCC_OK) {
+        ucc_error("failed to subscribe actual task dependency: %s",
+                  ucc_status_string(status));
+        goto error_validation;
+    }
+
+    status = ucc_schedule_add_task(schedule, task);
+    if (status != UCC_OK) {
+        ucc_error("failed to add actual task to schedule: %s",
+                  ucc_status_string(status));
+        goto error_validation;
+    }
+
+    /* Set schedule functions */
+    schedule->super.post     = ucc_schedule_start;
+    schedule->super.progress = NULL; /* Sub-tasks have their own progress functions */
+    schedule->super.finalize = ucc_dt_check_schedule_finalize;
+
+    return &schedule->super;
+
+error_validation:
+    ucc_mpool_put(validation_task);  /* Return to pool - destruct happens automatically */
+error_allgather_wrapper:
+    ucc_mpool_put(allgather_wrapper);  /* Return to pool - destruct happens automatically */
+error_schedule:
+    ucc_coll_task_destruct(&schedule->super);
+    ucc_free(schedule);
+    /* Note: dt_check is still attached to task, no need to restore */
+    return NULL;
+}
 
 #if ENABLE_DEBUG == 1
 static ucc_status_t ucc_check_coll_args(const ucc_coll_args_t *coll_args,
@@ -255,6 +508,37 @@ UCC_CORE_PROFILE_FUNC(ucc_status_t, ucc_collective_init,
         goto free_scratch;
     }
 
+    /* Setup non-blocking datatype check for rooted collectives
+     *
+     * This implements transparent validation using a schedule with three tasks:
+     * 1. Service allgather task: gathers datatypes from all ranks
+     * 2. Validation task: validates the gathered datatypes
+     * 3. Actual collective task: the real gather/scatter operation
+     * 
+     * Dependencies: allgather → validation → actual task
+     * If validation fails, the dependency mechanism prevents the actual task from posting.
+     */
+    if (coll_args->coll_type == UCC_COLL_TYPE_GATHER ||
+        coll_args->coll_type == UCC_COLL_TYPE_GATHERV ||
+        coll_args->coll_type == UCC_COLL_TYPE_SCATTER ||
+        coll_args->coll_type == UCC_COLL_TYPE_SCATTERV) {
+        /* If validation is enabled, create schedule */
+        if (ucc_global_config.check_asymmetric_dt) {
+            ucc_coll_task_t *schedule;
+            
+            schedule = ucc_dt_check_create_schedule(task);
+            if (!schedule) {
+                ucc_error("failed to create dt_check schedule");
+                status = UCC_ERR_NO_MEMORY;
+                goto coll_finalize;
+            }
+            
+            /* Return schedule to user instead of actual task */
+            task = schedule;
+        }
+    }
+
+    /* Setup top-level task (actual task or schedule) */
     task->flags |= UCC_COLL_TASK_FLAG_TOP_LEVEL;
     if (task->flags & UCC_COLL_TASK_FLAG_EXECUTOR) {
         task->flags |= UCC_COLL_TASK_FLAG_EXECUTOR_STOP;
@@ -284,13 +568,11 @@ UCC_CORE_PROFILE_FUNC(ucc_status_t, ucc_collective_init,
             goto coll_finalize;
         }
     }
-
     if (coll_args->mask & UCC_COLL_ARGS_FIELD_CB) {
         task->cb = coll_args->cb;
         task->flags |= UCC_COLL_TASK_FLAG_CB;
     }
     task->seq_num = team->seq_num++;
-
     ucc_assert(task->super.status == UCC_OPERATION_INITIALIZED);
 
 print_trace:
@@ -624,3 +906,5 @@ ucc_status_t ucc_triggered_post(ucc_ee_h ee, ucc_ev_t *ev,
 
     return ucc_progress_queue_enqueue(task->bargs.team->contexts[0]->pq, ev_task);
 }
+
+

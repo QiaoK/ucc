@@ -247,8 +247,31 @@ UCC_CORE_PROFILE_FUNC(ucc_status_t, ucc_collective_init,
 
     status = ucc_coll_init(team->score_map, &op_args, &task);
     if (UCC_ERR_NOT_SUPPORTED == status) {
-        ucc_debug("failed to init collective: not supported");
-        goto free_scratch;
+        /* If asymmetric-datatype detection is enabled and this is a rooted
+           collective, the local TL/CL may have rejected this rank's args
+           (e.g. non-predefined dt), but other ranks may have accepted them.
+           We still need ucc_service_dt_check to run a cross-rank allreduce
+           so every rank reaches the same verdict (UCC_ERR_NOT_SUPPORTED)
+           and the upper layer (e.g. OMPI) can fall back uniformly. Build a
+           dummy "actual" task carrying the metadata the dt_check schedule
+           needs; the dummy is never actually executed because validation
+           will fail. */
+        if (ucc_global_config.check_asymmetric_dt &&
+            (coll_args->coll_type == UCC_COLL_TYPE_GATHER  ||
+             coll_args->coll_type == UCC_COLL_TYPE_GATHERV ||
+             coll_args->coll_type == UCC_COLL_TYPE_SCATTER ||
+             coll_args->coll_type == UCC_COLL_TYPE_SCATTERV)) {
+            task = ucc_dt_check_create_dummy_task(team, &op_args);
+            if (!task) {
+                ucc_error("failed to allocate dummy task for dt_check");
+                status = UCC_ERR_NO_MEMORY;
+                goto free_scratch;
+            }
+            /* Fall through into the dt_check branch below. */
+        } else {
+            ucc_debug("failed to init collective: not supported");
+            goto free_scratch;
+        }
     } else if (ucc_unlikely(status < 0)) {
         char coll_args_str[256] = {0};
         ucc_coll_args_str(&op_args.args, team->rank, team->size, coll_args_str,

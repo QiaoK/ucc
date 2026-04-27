@@ -657,3 +657,64 @@ error_schedule:
     }
     return NULL;
 }
+
+/**
+ * Defensive post() for the dummy actual task.
+ *
+ * Should never be reached: when a dummy task is created, the cross-rank
+ * dt_check validation always fails (the rank with the non-predefined dt
+ * seeds UCC_ERR_NOT_SUPPORTED into the min/max reduce), so
+ * ucc_dt_check_actual_wrapper_post short-circuits before calling post().
+ * If something does call us, fail cleanly instead of pretending success.
+ */
+static ucc_status_t ucc_dt_check_dummy_post(ucc_coll_task_t *task)
+{
+    task->status = UCC_ERR_NOT_SUPPORTED;
+    task->super.status = UCC_ERR_NOT_SUPPORTED;
+    return UCC_ERR_NOT_SUPPORTED;
+}
+
+ucc_coll_task_t* ucc_dt_check_create_dummy_task(ucc_team_t *team,
+                                                ucc_base_coll_args_t *bargs)
+{
+    ucc_coll_task_t *dummy;
+    ucc_base_team_t *base_team;
+    ucc_status_t     status;
+
+    if (!team || !bargs) {
+        return NULL;
+    }
+
+    /* The dummy is never actually executed: it just needs ANY valid
+       ucc_base_team_t* in this context for ucc_schedule_init / the
+       wrapper ucc_coll_task_init inside ucc_service_dt_check (those
+       only dereference team->context). The first CL team is always
+       present on an active team (ucc_team_create asserts n_cl_teams > 0). */
+    if (ucc_unlikely(team->n_cl_teams == 0 || !team->cl_teams[0])) {
+        ucc_error("cannot create dt_check dummy task: no CL team available");
+        return NULL;
+    }
+    base_team = &team->cl_teams[0]->super;
+
+    dummy = ucc_mpool_get(&team->contexts[0]->lib->stub_tasks_mp);
+    if (!dummy) {
+        ucc_error("failed to allocate dummy actual task from mpool");
+        return NULL;
+    }
+
+    /* Populate task->bargs (full args, team handle, asymmetric scratch info)
+       and task->team (base team). ucc_coll_task_init also installs default
+       ucc_dummy_post/progress/finalize. The default ucc_dummy_finalize
+       (mpool_put) is exactly what we want for cleanup; we override post()
+       so we never report a fake success if ever invoked. */
+    status = ucc_coll_task_init(dummy, bargs, base_team);
+    if (status != UCC_OK) {
+        ucc_error("failed to init dummy actual task: %s",
+                  ucc_status_string(status));
+        ucc_mpool_put(dummy);
+        return NULL;
+    }
+
+    dummy->post = ucc_dt_check_dummy_post;
+    return dummy;
+}
